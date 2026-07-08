@@ -1,0 +1,20 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.token
+mi.token
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+xiaomi-venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+config.yaml
+config.local.yaml
+*.log

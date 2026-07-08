@@ -1,0 +1,26 @@
+name: xiaomi-speaker
+label: Xiaomi AI Speaker (小爱同学)
+kind: platform
+version: 0.1.0
+description: Voice-activated channel adapter — talk to your Hermes agent through Xiaomi AI Speaker (小爱同学)
+author: Kyle Zhike
+requires_env:
+  - MI_USER
+  - MI_PASS
+  - name: XIAOMI_TRIGGER
+    description: "Trigger keyword to activate Hermes (e.g. '阿峰')"
+    prompt: "Trigger Keyword"
+    password: false
+optional_env:
+  - name: MI_DID
+    description: "Xiaomi device DID (auto-detected if empty)"
+    password: false
+  - name: XIAOMI_POLL_INTERVAL
+    description: "Polling interval in seconds (default: 0.5)"
+    password: false
+  - name: XIAOMI_MUTE_DEFAULT
+    description: "Suppress XiaoAi's default response when triggered (default: true)"
+    password: false
+  - name: XIAOMI_DEFAULT_DEVICE
+    description: "Default device name for multi-speaker setups"
+    password: false
