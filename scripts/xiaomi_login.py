@@ -20,8 +20,7 @@ import os
 import sys
 
 import aiohttp
-from miservice.miaccount import MiAccount
-from miservice.miservice import MiNAService
+from miservice import MiAccount, MiNAService
 
 
 async def main():
