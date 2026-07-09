@@ -93,8 +93,8 @@ class ConversationPoller:
         log.info("New conversation: '%s' → '%s'",
                  entry.query[:50], entry.answer[:50])
 
-        # Check if trigger keyword is present
-        if self._trigger.lower() not in entry.query.lower():
+        # Check if trigger keyword is present (fuzzy: match homophones)
+        if not self._matches_trigger(entry.query):
             log.debug("No trigger '%s' in '%s' — ignoring", self._trigger, entry.query[:50])
             return
 
@@ -131,26 +131,64 @@ class ConversationPoller:
             except Exception as e:
                 log.error("on_message callback error: %s", e)
 
+    def _matches_trigger(self, query: str) -> bool:
+        """Check if trigger keyword is present, allowing for homophone variants.
+
+        XiaoAi's speech recognition often returns homophones for the trigger
+        word (e.g. 阿峰/阿枫/阿疯 instead of 阿风). We match by:
+        1. Exact match (fast path)
+        2. Pinyin match — convert both to pinyin and compare
+        """
+        q = query.lower()
+        t = self._trigger.lower()
+        # Fast path: exact match
+        if t in q:
+            return True
+        # Pinyin fuzzy match
+        try:
+            from xpinyin import Pinyin
+            p = Pinyin()
+            q_pinyin = p.get_pinyin(q, splitter="").lower()
+            t_pinyin = p.get_pinyin(t, splitter="").lower()
+            return t_pinyin in q_pinyin
+        except ImportError:
+            # No xpinyin — try simple homophone map for common 阿风 variants
+            homophones = {"风": "风峰枫疯烽锋丰封", "峰": "风峰枫疯烽锋丰封",
+                          "枫": "风峰枫疯烽锋丰封", "疯": "风峰枫疯烽锋丰封"}
+            import re as _re
+            for orig_char, variants in homophones.items():
+                if orig_char in t:
+                    for v in variants:
+                        if t.replace(orig_char, v) in q:
+                            return True
+        return False
+
     def _extract_command(self, raw: str) -> str:
         """Extract the actual command from the raw utterance.
 
         Removes trigger keyword and common filler words.
-
-        Examples:
-            "阿峰帮我播放周杰伦的稻香" → "帮我播放周杰伦的稻香"
-            "阿峰，帮我播放周杰伦的《稻香》" → "帮我播放周杰伦的《稻香》"
-            "小爱同学问阿峰今天天气怎么样" → "今天天气怎么样"
+        Tolerates homophone variants of the trigger word.
         """
         text = raw
 
         # Remove "小爱同学" prefix (the hardware wake word)
         text = re.sub(r'^小爱同学[,，\s]*', '', text)
 
-        # Remove the trigger keyword and surrounding punctuation
-        # Handle: "阿峰帮我..." / "阿峰，帮我..." / "问阿峰..." / "阿峰 ..."
+        # Build a regex pattern that matches the trigger OR its homophone variants
+        trigger_chars = list(self._trigger)
+        # For each char, build [风峰枫疯烽锋丰封] pattern if it's a homophone char
+        homophone_map = {"风": "风峰枫疯烽锋丰封", "峰": "风峰枫疯烽锋丰封",
+                         "枫": "风峰枫疯烽锋丰封", "疯": "风峰枫疯烽锋丰封"}
+        trigger_pattern = ""
+        for ch in trigger_chars:
+            if ch in homophone_map:
+                trigger_pattern += f"[{homophone_map[ch]}]"
+            else:
+                trigger_pattern += re.escape(ch)
+
         patterns = [
-            rf'^问?{re.escape(self._trigger)}[,，\s]*',   # "阿峰，..." or "问阿峰..."
-            rf'^.*?{re.escape(self._trigger)}[,，\s]*',    # "...阿峰，..."
+            rf'^问?{trigger_pattern}[,，\s]*',
+            rf'^.*?{trigger_pattern}[,，\s]*',
         ]
         for pattern in patterns:
             new_text = re.sub(pattern, '', text, count=1)
@@ -158,9 +196,8 @@ class ConversationPoller:
                 text = new_text
                 break
 
-        # Also try removing trigger from anywhere in the text
-        if self._trigger.lower() in text.lower():
-            text = re.sub(rf'{re.escape(self._trigger)}', '', text, flags=re.IGNORECASE)
+        # Also remove any remaining trigger variants from the text
+        text = re.sub(trigger_pattern, '', text)
 
         # Clean up extra punctuation/whitespace
         text = re.sub(r'^[,，\s]+', '', text).strip()
