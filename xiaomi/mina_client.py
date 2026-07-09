@@ -103,10 +103,10 @@ class MinaClient:
         devices = []
         for d in raw or []:
             dev = XiaoAIDevice(
-                device_id=d.get("miotDID", d.get("deviceID", "")),
+                device_id=d.get("deviceID", ""),  # MiNA needs deviceID (UUID), NOT miotDID
                 name=d.get("name", "Unknown"),
                 model=d.get("model", ""),
-                serial=d.get("serialNumber", d.get("deviceID", "")),
+                serial=d.get("serialNumber", ""),
             )
             devices.append(dev)
             log.info("Found device: %s (%s) DID=%s", dev.name, dev.model, dev.device_id)
