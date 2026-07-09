@@ -112,6 +112,17 @@ class MinaClient:
             log.info("Found device: %s (%s) DID=%s", dev.name, dev.model, dev.device_id)
 
         self._devices = devices
+
+        # Set default device based on _did if specified
+        if self._did:
+            for d in devices:
+                if d.device_id == self._did or self._did in d.name:
+                    self._default_device = d
+                    log.info("Default device set to: %s (DID=%s)", d.name, d.device_id)
+                    break
+        elif devices:
+            self._default_device = devices[0]
+
         return devices
 
     def get_device(self, name_or_did: str = "") -> Optional[XiaoAIDevice]:
