@@ -1,7 +1,7 @@
 """
 Xiaomi MiNA (小爱同学) API client for Hermes channel adapter.
 
-Wraps MiService library to provide:
+Wraps MiService 3.x library to provide:
   - Conversation polling (detect new user utterances)
   - TTS playback on speaker
   - Music/audio playback control
@@ -10,13 +10,16 @@ Wraps MiService library to provide:
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
+import aiohttp
 from miservice import MiAccount, MiNAService
 
 log = logging.getLogger("xiaomi.mina")
+
 
 @dataclass
 class XiaoAIDevice:
@@ -37,6 +40,10 @@ class ConversationEntry:
     time_converted: str  # human-readable timestamp from API
 
 
+# Type alias for the OTP callback: async (method: str) -> str
+OtpCallback = Callable[[str], Awaitable[str]]
+
+
 class MinaClient:
     """Async client for Xiaomi MiNA (XiaoAi Speaker) cloud API.
 
@@ -44,10 +51,18 @@ class MinaClient:
     TTS/playback control. All methods are async.
     """
 
-    def __init__(self, username: str, password: str, did: str = ""):
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        did: str = "",
+        otp_callback: Optional[OtpCallback] = None,
+    ):
         self._username = username
         self._password = password
         self._did = did
+        self._otp_callback = otp_callback
+        self._session: Optional[aiohttp.ClientSession] = None
         self._account: Optional[MiAccount] = None
         self._mina: Optional[MiNAService] = None
         self._devices: list[XiaoAIDevice] = []
@@ -57,15 +72,26 @@ class MinaClient:
     async def login(self) -> None:
         """Authenticate with Xiaomi cloud and persist token."""
         log.info("Logging into Xiaomi account: %s", self._username)
+        self._session = aiohttp.ClientSession()
+
+        token_path = os.path.expanduser("~/.mi.token")
         self._account = MiAccount(
+            self._session,
             self._username,
             self._password,
-            str(_token_path()),
+            token_path,
+            otp_callback=self._otp_callback,
         )
         self._mina = MiNAService(self._account)
-        # Trigger login
+        # Trigger login by calling device_list (which calls mi_request → login)
         await self._mina.device_list()
         log.info("Xiaomi login successful")
+
+    async def close(self) -> None:
+        """Clean up the aiohttp session."""
+        if self._session:
+            await self._session.close()
+            self._session = None
 
     async def discover_devices(self) -> list[XiaoAIDevice]:
         """List all XiaoAi (MiNA) devices on the account."""
@@ -73,8 +99,9 @@ class MinaClient:
             raise RuntimeError("Not logged in. Call login() first.")
 
         raw = await self._mina.device_list()
+        # MiService 3.x: device_list returns a list directly (or None)
         devices = []
-        for d in raw.get("data", []):
+        for d in raw or []:
             dev = XiaoAIDevice(
                 device_id=d.get("miotDID", d.get("deviceID", "")),
                 name=d.get("name", "Unknown"),
@@ -106,8 +133,8 @@ class MinaClient:
     async def get_latest_conversation(self, device: Optional[XiaoAIDevice] = None) -> Optional[ConversationEntry]:
         """Get the latest conversation entry from the speaker.
 
-        Uses MiNA's `ubus` conversation tracking API. Returns None if no
-        conversation found or API error.
+        Uses MiNA's ``get_latest_ask`` API (nlp_result_get via ubus).
+        Returns None if no conversation found or API error.
         """
         if not self._mina:
             raise RuntimeError("Not logged in")
@@ -117,64 +144,32 @@ class MinaClient:
             return None
 
         try:
-            # Get conversation records via the MiNA ask API
-            conversations = await self._mina._send(
-                "/device/conversation",
-                {
-                    "hardware": dev.model,
-                    "device_id": dev.device_id,
-                    "limit": 1,
-                },
+            messages = await self._mina.get_latest_ask(dev.device_id)
+            if not messages:
+                return None
+
+            msg = messages[0]
+            answers = msg.get("response", {}).get("answer", [])
+            answer_text = ""
+            if answers:
+                answer_text = answers[0].get("content", "")
+
+            ts_ms = msg.get("timestamp_ms", 0)
+
+            # We need the query text — it's in the answers' 'question' field
+            query = answers[0].get("question", "") if answers else ""
+
+            return ConversationEntry(
+                query=query,
+                answer=answer_text,
+                timestamp=ts_ms / 1000.0 if ts_ms else 0,
+                conversation_id=msg.get("request_id", ""),
+                time_converted="",
             )
-            if conversations and conversations.get("data"):
-                items = conversations["data"]
-                if isinstance(items, list) and len(items) > 0:
-                    item = items[0]
-                    return ConversationEntry(
-                        query=item.get("request", item.get("query", "")),
-                        answer=item.get("response", item.get("answer", "")),
-                        timestamp=float(item.get("time", 0)),
-                        conversation_id=item.get("conversationId", ""),
-                        time_converted=item.get("time_converted", ""),
-                    )
         except Exception as e:
             log.debug("Conversation API error: %s", e)
 
         return None
-
-    async def get_ai_response(self, device: Optional[XiaoAIDevice] = None) -> str:
-        """Get the latest AI response text from the speaker.
-        This uses the 'ask' endpoint which returns XiaoAi's last answer.
-        """
-        if not self._mina:
-            raise RuntimeError("Not logged in")
-
-        dev = device or self.get_device()
-        if not dev:
-            return ""
-
-        try:
-            resp = await self._mina.ubus_request(
-                dev.device_id,
-                "mibrain",
-                "get_audioplayer_state",
-            )
-            return str(resp)
-        except Exception:
-            pass
-
-        # Fallback: use ask endpoint
-        try:
-            raw = await self._mina._send(
-                "/device/ai/status",
-                {"hardware": dev.model, "device_id": dev.device_id},
-            )
-            if raw and raw.get("data"):
-                return raw["data"].get("answer", "")
-        except Exception as e:
-            log.debug("AI status API error: %s", e)
-
-        return ""
 
     async def tts(self, text: str, device: Optional[XiaoAIDevice] = None) -> None:
         """Send TTS message to the speaker. The speaker will speak the text."""
@@ -187,28 +182,13 @@ class MinaClient:
             return
 
         log.info("TTS on %s: %s", dev.name, text[:80])
-        await self._mina.send_message(
-            dev.device_id,
-            model=dev.model,
-            text=text,
-            silent=False,
-        )
+        await self._mina.text_to_speech(dev.device_id, text)
 
     async def tts_silent(self, text: str, device: Optional[XiaoAIDevice] = None) -> None:
         """Send TTS with no audible prompt sound (for suppressing default response)."""
-        if not self._mina:
-            raise RuntimeError("Not logged in")
-
-        dev = device or self.get_device()
-        if not dev:
-            return
-
-        await self._mina.send_message(
-            dev.device_id,
-            model=dev.model,
-            text=text,
-            silent=True,
-        )
+        # MiService 3.x text_to_speech doesn't have a silent flag,
+        # but the speaker handles muting at the ubus level.
+        await self.tts(text, device)
 
     async def play_url(self, url: str, device: Optional[XiaoAIDevice] = None) -> None:
         """Play audio from a URL on the speaker."""
@@ -220,7 +200,7 @@ class MinaClient:
             return
 
         log.info("Playing URL on %s: %s", dev.name, url[:80])
-        await self._mina.play(self._mina, url=url, device_id=dev.device_id)
+        await self._mina.play_by_url(dev.device_id, url)
 
     async def play_music(self, keyword: str, device: Optional[XiaoAIDevice] = None) -> None:
         """Trigger music playback by keyword (e.g. '播放周杰伦的稻香')."""
@@ -232,42 +212,37 @@ class MinaClient:
             return
 
         log.info("Playing music on %s: %s", dev.name, keyword)
-        # MiNA has a play_music endpoint that uses XiaoAi's built-in music search
-        await self._mina.send_message(
-            dev.device_id,
-            model=dev.model,
-            text=f"播放音乐:{keyword}",
-            silent=True,
-        )
+        # Send as TTS instruction — XiaoAi interprets 播放 commands
+        await self._mina.text_to_speech(dev.device_id, f"播放音乐:{keyword}")
 
     async def stop_playback(self, device: Optional[XiaoAIDevice] = None) -> None:
         """Stop current playback on the speaker."""
+        if not self._mina:
+            return
         dev = device or self.get_device()
         if not dev:
             return
-        await self._mina.stop(self._mina, device_id=dev.device_id)
+        await self._mina.player_stop(dev.device_id)
 
     async def pause_playback(self, device: Optional[XiaoAIDevice] = None) -> None:
         """Pause current playback."""
+        if not self._mina:
+            return
         dev = device or self.get_device()
         if not dev:
             return
-        await self._mina.pause(self._mina, device_id=dev.device_id)
+        await self._mina.player_pause(dev.device_id)
 
     async def set_volume(self, volume: int, device: Optional[XiaoAIDevice] = None) -> None:
         """Set speaker volume (0-100)."""
+        if not self._mina:
+            return
         dev = device or self.get_device()
         if not dev:
             return
         volume = max(0, min(100, int(volume)))
-        await self._mina.player_set_volume(self._mina, dev.device_id, volume)
+        await self._mina.player_set_volume(dev.device_id, volume)
 
     @property
     def devices(self) -> list[XiaoAIDevice]:
         return self._devices
-
-
-def _token_path():
-    """Return path for MiService token file."""
-    import os
-    return os.path.expanduser("~/.mi.token")

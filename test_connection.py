@@ -170,6 +170,8 @@ async def main():
     if args.poll > 0:
         await test_poll(client, args.trigger, args.poll)
 
+    await client.close()
+
     log.info("─" * 50)
     log.info("Done!")
 
