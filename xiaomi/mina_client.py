@@ -9,6 +9,7 @@ Wraps MiService 3.x library to provide:
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -24,9 +25,9 @@ log = logging.getLogger("xiaomi.mina")
 @dataclass
 class XiaoAIDevice:
     """Represents a Xiaomi AI Speaker device."""
-    device_id: str       # miotDID / DID
+    device_id: str       # deviceID (UUID) for MiNA API
     name: str            # display name
-    model: str           # hardware model (e.g. xiaomi.wifispeaker.l15a)
+    model: str           # hardware model (e.g. L15A)
     serial: str          # serial number
 
 
@@ -103,9 +104,9 @@ class MinaClient:
         devices = []
         for d in raw or []:
             dev = XiaoAIDevice(
-                device_id=d.get("deviceID", ""),  # MiNA needs deviceID (UUID), NOT miotDID
+                device_id=d.get("deviceID", ""),
                 name=d.get("name", "Unknown"),
-                model=d.get("model", ""),
+                model=d.get("hardware", ""),  # hardware field (e.g. L15A)
                 serial=d.get("serialNumber", ""),
             )
             devices.append(dev)
@@ -144,10 +145,12 @@ class MinaClient:
     async def get_latest_conversation(self, device: Optional[XiaoAIDevice] = None) -> Optional[ConversationEntry]:
         """Get the latest conversation entry from the speaker.
 
-        Uses MiNA's ``get_latest_ask`` API (nlp_result_get via ubus).
+        Uses the conversation history API (same as xiaogpt):
+          GET https://userprofile.mina.mi.com/device_profile/v2/conversation
+
         Returns None if no conversation found or API error.
         """
-        if not self._mina:
+        if not self._session or not self._account:
             raise RuntimeError("Not logged in")
 
         dev = device or self.get_device()
@@ -155,27 +158,59 @@ class MinaClient:
             return None
 
         try:
-            messages = await self._mina.get_latest_ask(dev.device_id)
-            if not messages:
+            import time as _time
+            with open(os.path.expanduser("~/.mi.token")) as f:
+                token = json.load(f)
+            user_id = token["userId"]
+            service_token = token["micoapi"][1]
+            cookies = {
+                "deviceId": dev.device_id,
+                "userId": str(user_id),
+                "serviceToken": service_token,
+            }
+            headers = {
+                "User-Agent": "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) "
+                              "Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103"
+            }
+            hardware = dev.model or "L15A"
+            url = (
+                f"https://userprofile.mina.mi.com/device_profile/v2/conversation"
+                f"?source=dialogu&hardware={hardware}&timestamp={int(_time.time()*1000)}&limit=1"
+            )
+            async with self._session.get(url, headers=headers, cookies=cookies) as r:
+                data = await r.json()
+
+            raw = data.get("data", "")
+            if not raw:
+                return None
+            records = json.loads(raw).get("records", [])
+            if not records:
                 return None
 
-            msg = messages[0]
-            answers = msg.get("response", {}).get("answer", [])
+            rec = records[0]
+            query = rec.get("query", "")
             answer_text = ""
-            if answers:
-                answer_text = answers[0].get("content", "")
+            for ans in rec.get("answers", []):
+                if isinstance(ans, dict):
+                    llm = ans.get("llm", {})
+                    if isinstance(llm, dict) and llm.get("text"):
+                        answer_text = llm["text"]
+                        break
+                    to_speak = ans.get("content", {}).get("to_speak", {})
+                    if isinstance(to_speak, dict) and to_speak.get("text"):
+                        answer_text = to_speak["text"]
+                        break
 
-            ts_ms = msg.get("timestamp_ms", 0)
-
-            # We need the query text — it's in the answers' 'question' field
-            query = answers[0].get("question", "") if answers else ""
+            ts_ms = rec.get("time", 0)
+            from datetime import datetime
+            time_str = datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S") if ts_ms else ""
 
             return ConversationEntry(
                 query=query,
                 answer=answer_text,
                 timestamp=ts_ms / 1000.0 if ts_ms else 0,
-                conversation_id=msg.get("request_id", ""),
-                time_converted="",
+                conversation_id=rec.get("requestId", ""),
+                time_converted=time_str,
             )
         except Exception as e:
             log.debug("Conversation API error: %s", e)
