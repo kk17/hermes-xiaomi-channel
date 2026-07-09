@@ -65,12 +65,12 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         self._password = os.getenv("MI_PASS", "") or extra.get("mi_pass", "")
         self._did = os.getenv("MI_DID", "") or extra.get("mi_did", "")
         self._trigger = (
-            os.getenv("XIAOMI_TRIGGER", "阿峰")
-            or extra.get("trigger", "阿峰")
+            os.getenv("XIAOMI_TRIGGER", "阿风")
+            or extra.get("trigger", "阿风")
         )
         self._poll_interval = float(
-            os.getenv("XIAOMI_POLL_INTERVAL", "0.5")
-            or extra.get("poll_interval", "0.5")
+            os.getenv("XIAOMI_POLL_INTERVAL", "2.0")
+            or extra.get("poll_interval", "2.0")
         )
         self._mute_default = (
             os.getenv("XIAOMI_MUTE_DEFAULT", "true").lower() == "true"
@@ -308,7 +308,7 @@ def _env_enablement() -> dict | None:
     seed: dict[str, Any] = {
         "mi_user": user,
         "mi_pass": pw,
-        "trigger": os.getenv("XIAOMI_TRIGGER", "阿峰"),
+        "trigger": os.getenv("XIAOMI_TRIGGER", "阿风"),
     }
 
     did = os.getenv("MI_DID", "").strip()
@@ -331,6 +331,6 @@ def register(ctx):
         check_fn=check_requirements,
         validate_config=validate_config,
         required_env=["MI_USER", "MI_PASS", "XIAOMI_TRIGGER"],
-        install_hint="pip install miservice",
+        install_hint="pip install 'miservice>=3.0.0'",
         env_enablement_fn=_env_enablement,
     )
