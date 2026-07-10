@@ -37,7 +37,7 @@ from gateway.platforms.base import (
 from gateway.config import Platform, PlatformConfig
 
 # Local imports
-from xiaomi import MinaClient, ConversationPoller, InterceptedMessage
+from .xiaomi import MinaClient, ConversationPoller, InterceptedMessage, XiaoAIDevice
 
 log = logging.getLogger("xiaomi.adapter")
 
@@ -85,6 +85,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         self._poller: Optional[ConversationPoller] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._device_name: str = "Xiaomi Speaker"
+        self._last_active_device: Optional[XiaoAIDevice] = None
 
     # ── Lifecycle ──────────────────────────────────────────
 
@@ -115,19 +116,25 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             log.error("No Xiaomi AI speakers found on this account")
             return False
 
-        # Select default device
+        # Select default device (for TTS fallback)
         dev = self._client.get_device(self._default_device_name)
         if dev:
             self._device_name = dev.name
-            log.info("Using speaker: %s (%s) DID=%s", dev.name, dev.model, dev.device_id)
+            log.info("Default speaker: %s (%s) DID=%s", dev.name, dev.model, dev.device_id)
 
-        # Start conversation poller
+        # All devices for multi-speaker polling
+        all_devices = self._client.devices
+        dev_names = ", ".join(d.name for d in all_devices)
+        log.info("Monitoring %d speaker(s): [%s]", len(all_devices), dev_names)
+
+        # Start conversation poller with all devices
         self._poller = ConversationPoller(
             client=self._client,
             trigger=self._trigger,
             poll_interval=self._poll_interval,
             mute_default=self._mute_default,
             on_message=self._on_intercepted_message,
+            devices=all_devices,
         )
         self._poll_task = asyncio.create_task(self._poller.start())
 
@@ -155,20 +162,31 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
     async def _on_intercepted_message(self, msg: InterceptedMessage) -> None:
         """Handle an intercepted voice command — forward to Hermes gateway."""
-        log.info("Forwarding to Hermes: '%s'", msg.text[:80])
+        log.info("Forwarding to Hermes (from %s): '%s'",
+                 msg.device.name if msg.device else "?", msg.text[:80])
 
-        event = MessageEvent(
-            platform=Platform("xiaomi_speaker"),
+        # Remember which device sent this message so send() can route TTS back
+        self._last_active_device = msg.device
+
+        dev_name = msg.device.name if msg.device else "Xiaomi Speaker"
+        source = self.build_source(
             chat_id=SPEAKER_CHAT_ID,
+            chat_name=dev_name,
+            chat_type="dm",
             user_id="voice_user",
             user_name="Voice",
-            content=msg.text,
+        )
+
+        event = MessageEvent(
+            text=msg.text,
             message_type=MessageType.TEXT,
+            source=source,
             message_id=str(uuid.uuid4()),
-            raw_event={
+            raw_message={
                 "raw_text": msg.raw_text,
                 "trigger": msg.trigger,
-                "device": msg.device.name if msg.device else "",
+                "device": dev_name,
+                "device_id": msg.device.device_id if msg.device else "",
                 "timestamp": msg.timestamp,
             },
         )
@@ -186,6 +204,9 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send Hermes response to the speaker via TTS.
 
+        Routes TTS to the device that the user spoke to (tracked via
+        _last_active_device). Falls back to the default device.
+
         For long responses, text is chunked into segments ≤200 chars and
         each chunk is spoken sequentially with a small delay.
         """
@@ -195,32 +216,35 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True, message_id="empty")
 
+        # Route TTS to the device the user spoke to
+        target_device = self._last_active_device or self._client.get_device()
         text = content.strip()
-        log.info("TTS response (%d chars): %s", len(text), text[:80])
+        dev_label = target_device.name if target_device else "default"
+        log.info("TTS response (%d chars) → %s: %s", len(text), dev_label, text[:80])
 
         # Handle special actions from metadata
         if metadata:
             action = metadata.get("action")
             if action == "play_music":
                 keyword = metadata.get("keyword", text)
-                await self._client.play_music(keyword)
+                await self._client.play_music(keyword, target_device)
                 return SendResult(success=True, message_id="play_music")
             if action == "play_url":
                 url = metadata.get("url", "")
                 if url:
-                    await self._client.play_url(url)
+                    await self._client.play_url(url, target_device)
                     return SendResult(success=True, message_id="play_url")
 
         # Chunk and speak via TTS
         chunks = self._chunk_text(text, TTS_CHUNK_SIZE)
         for i, chunk in enumerate(chunks):
             try:
-                await self._client.tts(chunk)
+                await self._client.tts(chunk, target_device)
                 # Small pause between chunks for natural speech
                 if i < len(chunks) - 1:
                     await asyncio.sleep(1.5)
             except Exception as e:
-                log.error("TTS error on chunk %d: %s", i, e)
+                log.error("TTS error on chunk %d (%s): %s", i, dev_label, e)
                 return SendResult(success=False, error=str(e))
 
         return SendResult(success=True, message_id=str(uuid.uuid4()))
@@ -233,7 +257,8 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         """
         if self._client:
             try:
-                await self._client.tts_silent("让我想想")
+                target = self._last_active_device or None
+                await self._client.tts_silent("让我想想", target)
             except Exception:
                 pass
 
@@ -333,4 +358,5 @@ def register(ctx):
         required_env=["MI_USER", "MI_PASS", "XIAOMI_TRIGGER"],
         install_hint="pip install 'miservice>=3.0.0'",
         env_enablement_fn=_env_enablement,
+        allow_all_env="XIAOMI_ALLOW_ALL_USERS",
     )
