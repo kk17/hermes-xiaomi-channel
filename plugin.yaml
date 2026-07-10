@@ -24,3 +24,6 @@ optional_env:
   - name: XIAOMI_DEFAULT_DEVICE
     description: "Default device name for multi-speaker setups"
     password: false
+  - name: XIAOMI_DEFAULT_MODEL
+    description: "Default AI model for voice sessions (e.g. 'coding-low' for faster responses)"
+    password: false

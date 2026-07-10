@@ -79,6 +79,9 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             os.getenv("XIAOMI_DEFAULT_DEVICE", "")
             or extra.get("default_device", "")
         )
+        # Default model for voice sessions (lighter model = faster response)
+        self._default_model = os.getenv("XIAOMI_DEFAULT_MODEL", "")
+        self._model_initialized = False
 
         # Runtime state
         self._client: Optional[MinaClient] = None
@@ -160,13 +163,47 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
     # ── Inbound: conversation → Hermes ────────────────────
 
+    # Voice model-switch keywords: maps spoken phrase → /model command
+    _MODEL_SWITCH_KEYWORDS: dict[str, str] = {
+        "简单模型": "/model coding-low",
+        "快速模型": "/model coding-low",
+        "高级模型": "/model coding",
+        "智能模型": "/model coding",
+    }
+
     async def _on_intercepted_message(self, msg: InterceptedMessage) -> None:
-        """Handle an intercepted voice command — forward to Hermes gateway."""
+        """Handle an intercepted voice command — forward to Hermes gateway.
+
+        Sends a quick "阿峰收到" confirmation TTS immediately, then checks
+        for voice-activated model switching keywords.
+        """
         log.info("Forwarding to Hermes (from %s): '%s'",
                  msg.device.name if msg.device else "?", msg.text[:80])
 
         # Remember which device sent this message so send() can route TTS back
         self._last_active_device = msg.device
+
+        # Immediate confirmation TTS so user knows the message was received
+        if self._client and msg.device:
+            try:
+                await self._client.tts("阿峰收到", msg.device)
+            except Exception as e:
+                log.warning("Confirmation TTS failed: %s", e)
+
+        # Check for voice-activated model switching
+        command_text = msg.text.strip()
+        for phrase, model_cmd in self._MODEL_SWITCH_KEYWORDS.items():
+            if phrase in command_text:
+                log.info("Voice model switch: '%s' → %s", command_text, model_cmd)
+                # Execute /model command via the gateway command handler
+                if self._client and msg.device:
+                    try:
+                        await self._client.tts("好的，正在切换", msg.device)
+                    except Exception:
+                        pass
+                # Inject as a /model command
+                command_text = model_cmd
+                break
 
         dev_name = msg.device.name if msg.device else "Xiaomi Speaker"
         source = self.build_source(
@@ -177,8 +214,24 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             user_name="Voice",
         )
 
+        # Inject default model on first voice message (lighter = faster)
+        if self._default_model and not self._model_initialized:
+            self._model_initialized = True
+            log.info("Setting default voice model: %s", self._default_model)
+            # Send /model command first, then the real message
+            model_event = MessageEvent(
+                text=f"/model {self._default_model} --session",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=str(uuid.uuid4()),
+                raw_message={},
+            )
+            await self.handle_message(model_event)
+            # Small delay to let /model take effect before the real message
+            await asyncio.sleep(0.5)
+
         event = MessageEvent(
-            text=msg.text,
+            text=command_text,
             message_type=MessageType.TEXT,
             source=source,
             message_id=str(uuid.uuid4()),
