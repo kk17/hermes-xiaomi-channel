@@ -170,6 +170,9 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         "智能模型": "coding",
     }
 
+    # Voice stop keywords: when detected, interrupt the running agent
+    _STOP_KEYWORDS: set[str] = {"停止", "暂停", "停下", "停下来", "别说了"}
+
     async def _on_intercepted_message(self, msg: InterceptedMessage) -> None:
         """Handle an intercepted voice command — forward to Hermes gateway.
 
@@ -191,6 +194,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
         command_text = msg.text.strip()
 
+        # Build source early — needed for stop/interrupt before message dispatch
         dev_name = msg.device.name if msg.device else "Xiaomi Speaker"
         source = self.build_source(
             chat_id=SPEAKER_CHAT_ID,
@@ -199,6 +203,33 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             user_id="voice_user",
             user_name="Voice",
         )
+
+        # Check for voice stop command — interrupt running agent immediately
+        if any(kw in command_text for kw in self._STOP_KEYWORDS):
+            log.info("Voice stop command: '%s'", command_text)
+            try:
+                runner = getattr(self, "gateway_runner", None)
+                if runner:
+                    from gateway.session import build_session_key
+                    session_key = build_session_key(source)
+                    # Stop TTS playback on the speaker
+                    if self._client and msg.device:
+                        await self._client.stop_playback(msg.device)
+                    # Interrupt the running agent
+                    if hasattr(runner, "_interrupt_and_clear_session"):
+                        from gateway.run import _INTERRUPT_REASON_STOP
+                        await runner._interrupt_and_clear_session(
+                            session_key,
+                            source,
+                            interrupt_reason=_INTERRUPT_REASON_STOP,
+                            invalidation_reason="voice_stop_command",
+                        )
+                    # Also use adapter's interrupt for good measure
+                    await self.interrupt_session_activity(session_key, SPEAKER_CHAT_ID)
+                    log.info("Agent interrupted by voice stop command")
+            except Exception as e:
+                log.warning("Voice stop failed: %s", e)
+            return  # Don't forward to agent — just stop
 
         # Voice-activated model switching (silent, via session_model_overrides)
         target_model = self._default_model  # start with default
