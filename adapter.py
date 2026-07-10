@@ -173,6 +173,9 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
     # Voice stop keywords: when detected, interrupt the running agent
     _STOP_KEYWORDS: set[str] = {"停止", "暂停", "停下", "停下来", "别说了"}
 
+    # Voice status keywords: check if agent is running
+    _STATUS_KEYWORDS: set[str] = {"状态", "在吗", "在干嘛", "在不在"}
+
     async def _on_intercepted_message(self, msg: InterceptedMessage) -> None:
         """Handle an intercepted voice command — forward to Hermes gateway.
 
@@ -230,6 +233,28 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             except Exception as e:
                 log.warning("Voice stop failed: %s", e)
             return  # Don't forward to agent — just stop
+
+        # Check for voice status command — report if agent is running
+        if any(kw in command_text for kw in self._STATUS_KEYWORDS):
+            is_running = False
+            try:
+                runner = getattr(self, "gateway_runner", None)
+                if runner:
+                    from gateway.session import build_session_key
+                    session_key = build_session_key(source)
+                    running = getattr(runner, "_running_agents", {})
+                    is_running = session_key in running and running[session_key] is not None
+            except Exception as e:
+                log.warning("Status check failed: %s", e)
+
+            reply = "阿峰在干活中" if is_running else "阿峰在休息"
+            log.info("Voice status: %s (running=%s)", reply, is_running)
+            if self._client and msg.device:
+                try:
+                    await self._client.tts(reply, msg.device)
+                except Exception as e:
+                    log.warning("Status TTS failed: %s", e)
+            return  # Don't forward to agent
 
         # Voice-activated model switching (silent, via session_model_overrides)
         target_model = self._default_model  # start with default
