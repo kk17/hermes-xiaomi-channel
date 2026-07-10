@@ -81,7 +81,6 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         )
         # Default model for voice sessions (lighter model = faster response)
         self._default_model = os.getenv("XIAOMI_DEFAULT_MODEL", "")
-        self._model_initialized = False
 
         # Runtime state
         self._client: Optional[MinaClient] = None
@@ -214,21 +213,24 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             user_name="Voice",
         )
 
-        # Inject default model on first voice message (lighter = faster)
-        if self._default_model and not self._model_initialized:
-            self._model_initialized = True
-            log.info("Setting default voice model: %s", self._default_model)
-            # Send /model command first, then the real message
-            model_event = MessageEvent(
-                text=f"/model {self._default_model} --session",
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=str(uuid.uuid4()),
-                raw_message={},
-            )
-            await self.handle_message(model_event)
-            # Small delay to let /model take effect before the real message
-            await asyncio.sleep(0.5)
+        # Inject default model for voice sessions (lighter = faster)
+        # Done every message — setting it on the dict is idempotent and cheap,
+        # and it survives session resets (the override persists for the session
+        # key, so even after 4am reset the next message re-sets it silently).
+        if self._default_model:
+            try:
+                runner = getattr(self, "gateway_runner", None)
+                if runner and hasattr(runner, "_session_model_overrides"):
+                    from gateway.session import build_session_key
+                    session_key = build_session_key(source)
+                    if session_key not in runner._session_model_overrides:
+                        runner._session_model_overrides[session_key] = {
+                            "model": self._default_model,
+                        }
+                        log.info("Set voice session model override: %s → %s (silent)",
+                                 session_key, self._default_model)
+            except Exception as e:
+                log.warning("Failed to set model override: %s", e)
 
         event = MessageEvent(
             text=command_text,
