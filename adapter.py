@@ -162,12 +162,12 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
     # ── Inbound: conversation → Hermes ────────────────────
 
-    # Voice model-switch keywords: maps spoken phrase → /model command
+    # Voice model-switch keywords: maps spoken phrase → model name
     _MODEL_SWITCH_KEYWORDS: dict[str, str] = {
-        "简单模型": "/model coding-low",
-        "快速模型": "/model coding-low",
-        "高级模型": "/model coding",
-        "智能模型": "/model coding",
+        "简单模型": "coding-low",
+        "快速模型": "coding-low",
+        "高级模型": "coding",
+        "智能模型": "coding",
     }
 
     async def _on_intercepted_message(self, msg: InterceptedMessage) -> None:
@@ -189,20 +189,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             except Exception as e:
                 log.warning("Confirmation TTS failed: %s", e)
 
-        # Check for voice-activated model switching
         command_text = msg.text.strip()
-        for phrase, model_cmd in self._MODEL_SWITCH_KEYWORDS.items():
-            if phrase in command_text:
-                log.info("Voice model switch: '%s' → %s", command_text, model_cmd)
-                # Execute /model command via the gateway command handler
-                if self._client and msg.device:
-                    try:
-                        await self._client.tts("好的，正在切换", msg.device)
-                    except Exception:
-                        pass
-                # Inject as a /model command
-                command_text = model_cmd
-                break
 
         dev_name = msg.device.name if msg.device else "Xiaomi Speaker"
         source = self.build_source(
@@ -213,22 +200,31 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             user_name="Voice",
         )
 
-        # Inject default model for voice sessions (lighter = faster)
-        # Done every message — setting it on the dict is idempotent and cheap,
-        # and it survives session resets (the override persists for the session
-        # key, so even after 4am reset the next message re-sets it silently).
-        if self._default_model:
+        # Voice-activated model switching (silent, via session_model_overrides)
+        target_model = self._default_model  # start with default
+        for phrase, model_name in self._MODEL_SWITCH_KEYWORDS.items():
+            if phrase in command_text:
+                target_model = model_name
+                log.info("Voice model switch: '%s' → %s", command_text, model_name)
+                break
+
+        # Apply model override for this voice session (silent, no TTS)
+        if target_model:
             try:
                 runner = getattr(self, "gateway_runner", None)
                 if runner and hasattr(runner, "_session_model_overrides"):
                     from gateway.session import build_session_key
                     session_key = build_session_key(source)
-                    if session_key not in runner._session_model_overrides:
+                    current = runner._session_model_overrides.get(session_key, {})
+                    if current.get("model") != target_model:
                         runner._session_model_overrides[session_key] = {
-                            "model": self._default_model,
+                            "model": target_model,
                         }
-                        log.info("Set voice session model override: %s → %s (silent)",
-                                 session_key, self._default_model)
+                        # Evict cached agent so new model takes effect
+                        if hasattr(runner, "_evict_cached_agent"):
+                            runner._evict_cached_agent(session_key)
+                        log.info("Voice session model set: %s → %s (silent)",
+                                 session_key, target_model)
             except Exception as e:
                 log.warning("Failed to set model override: %s", e)
 
