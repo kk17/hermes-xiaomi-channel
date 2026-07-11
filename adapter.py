@@ -99,11 +99,21 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
         log.info("Connecting Xiaomi Speaker channel (trigger='%s')", self._trigger)
 
-        # Initialize MiNA client
+        # Initialize MiNA client with OTP callback that logs and raises
+        # (instead of silently retrying and triggering rate limits)
+        async def _otp_cb(otp_method: str) -> str:
+            log.error("Xiaomi OTP required (%s) — manual login needed. "
+                      "Run login script on NAS to refresh token.", otp_method)
+            raise RuntimeError(
+                f"Xiaomi OTP required ({otp_method}). Token expired — "
+                "run login script on NAS to refresh ~/.mi.token"
+            )
+
         self._client = MinaClient(
             username=self._username,
             password=self._password,
             did=self._did,
+            otp_callback=_otp_cb,
         )
 
         try:
