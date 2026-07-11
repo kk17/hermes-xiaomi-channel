@@ -236,17 +236,23 @@ class MinaClient:
         # but the speaker handles muting at the ubus level.
         await self.tts(text, device)
 
-    async def play_url(self, url: str, device: Optional[XiaoAIDevice] = None) -> None:
+    async def play_url(self, url: str, device: Optional[XiaoAIDevice] = None) -> bool:
         """Play audio from a URL on the speaker."""
         if not self._mina:
             raise RuntimeError("Not logged in")
 
         dev = device or self.get_device()
         if not dev:
-            return
+            return False
 
         log.info("Playing URL on %s: %s", dev.name, url[:80])
-        await self._mina.play_by_url(dev.device_id, url)
+        try:
+            result = await self._mina.play_by_url(dev.device_id, url)
+            log.info("play_by_url result: %s", result)
+            return result
+        except Exception as e:
+            log.error("play_by_url failed: %s", e)
+            raise
 
     async def play_music(self, keyword: str, device: Optional[XiaoAIDevice] = None) -> None:
         """Trigger music playback by keyword (e.g. '播放周杰伦的稻香')."""
