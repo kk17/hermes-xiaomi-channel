@@ -91,7 +91,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
     # ── Lifecycle ──────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Xiaomi cloud and start conversation polling."""
         if not self._username or not self._password:
             log.error("MI_USER and MI_PASS are required")
