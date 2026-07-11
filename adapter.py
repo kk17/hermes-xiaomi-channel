@@ -297,13 +297,10 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             if self._client and msg.device:
                 try:
                     # Skip TTS — it blocks the speaker from playing the URL
-                    # Search YouTube and get direct audio URL via yt-dlp
-                    audio_url = await self._get_youtube_audio_url(query)
-                    if audio_url:
-                        result = await self._client.play_url(audio_url, msg.device)
-                        log.info("Playing YouTube music on %s (result=%s)", msg.device.name, result)
-                        if not result:
-                            await self._client.tts("播放失败", msg.device)
+                    # Search YouTube, proxy locally, play on speaker
+                    success = await self._search_and_play_youtube(query, msg.device)
+                    if success:
+                        log.info("Playing YouTube music on %s", msg.device.name)
                     else:
                         await self._client.tts("抱歉，没找到这首歌", msg.device)
                 except Exception as e:
@@ -358,21 +355,106 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
     # ── Music playback helpers ────────────────────────────
 
-    async def _get_youtube_audio_url(self, query: str) -> Optional[str]:
-        """Search YouTube Music and return a direct audio stream URL.
+    _proxy_port: int = 8899
+    _proxy_started: bool = False
 
-        Uses yt-dlp to search and extract a playable audio URL (m4a format
-        for broad device compatibility).
+    async def _ensure_proxy_server(self) -> bool:
+        """Start a local streaming proxy if not already running.
+
+        The proxy accepts /stream?u=<encoded_url> and proxies the upstream
+        audio stream to the speaker. This avoids YouTube stream drops when
+        the speaker connects to googlevideo.com directly.
+        """
+        if self._proxy_started:
+            return True
+
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("0.0.0.0", self._proxy_port))
+            sock.close()
+        except OSError:
+            log.warning("Port %d already in use, assuming proxy is running", self._proxy_port)
+            self._proxy_started = True
+            return True
+
+        from aiohttp import web
+
+        async def _proxy(request):
+            upstream_url = request.query.get("u", "")
+            if not upstream_url or not upstream_url.startswith("http"):
+                return web.Response(status=400, text="missing u param")
+            try:
+                # Stream from upstream, pipe to client
+                upstream_session = aiohttp.ClientSession()
+                resp = await upstream_session.get(upstream_url)
+                if resp.status != 200:
+                    await upstream_session.close()
+                    return web.Response(status=502, text=f"upstream {resp.status}")
+
+                headers = {
+                    "Content-Type": resp.headers.get("Content-Type", "audio/mp4"),
+                    "Content-Length": resp.headers.get("Content-Length", ""),
+                    "Accept-Ranges": "bytes",
+                }
+                # Stream chunks
+                proxy_resp = web.StreamResponse(status=200, headers=headers)
+                await proxy_resp.prepare(request)
+                try:
+                    async for chunk in resp.content.iter_any():
+                        await proxy_resp.write(chunk)
+                finally:
+                    await upstream_session.close()
+                await proxy_resp.write_eof()
+                return proxy_resp
+            except Exception as e:
+                log.warning("Proxy error: %s", e)
+                return web.Response(status=500, text=str(e))
+
+        app = web.Application()
+        app.router.add_get("/stream", _proxy)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self._proxy_port)
+        await site.start()
+        self._proxy_started = True
+        log.info("Audio proxy server started on port %d", self._proxy_port)
+        return True
+
+    def _get_local_ip(self) -> str:
+        """Get the local network IP address."""
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.168.31.1", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    async def _search_and_play_youtube(self, query: str, device) -> bool:
+        """Search YouTube, get audio URL, proxy it locally, play on speaker.
+
+        Flow:
+        1. yt-dlp search → get googlevideo.com direct audio URL
+        2. Start local proxy server (once, reused)
+        3. Build proxy URL: http://<local_ip>:8899/stream?u=<encoded_url>
+        4. play_by_url(proxy_url, device)
+
+        The proxy streams from YouTube to the speaker, avoiding the
+        stream drops that happen when the speaker connects directly.
         """
         import shutil
         import asyncio
+        from urllib.parse import quote
 
         ytdlp = shutil.which("yt-dlp")
         if not ytdlp:
             log.error("yt-dlp not found on PATH")
-            return None
+            return False
 
-        # yt-dlp search: "ytsearch1:query" returns first result
+        # Step 1: Search YouTube and get direct audio URL
         cmd = [
             ytdlp, "-g", "-f", "140",
             f"ytsearch1:{query}",
@@ -387,19 +469,30 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
-            url = stdout.decode().strip()
-            if url and url.startswith("http"):
-                log.info("yt-dlp got audio URL (%d chars)", len(url))
-                return url
-            else:
+            yt_url = stdout.decode().strip()
+            if not yt_url or not yt_url.startswith("http"):
                 log.warning("yt-dlp returned no URL. stderr: %s", stderr.decode()[:200])
-                return None
+                return False
+            log.info("yt-dlp got audio URL (%d chars)", len(yt_url))
         except asyncio.TimeoutError:
             log.warning("yt-dlp search timed out for: %s", query)
-            return None
+            return False
         except Exception as e:
             log.warning("yt-dlp search failed: %s", e)
-            return None
+            return False
+
+        # Step 2: Ensure proxy server is running
+        await self._ensure_proxy_server()
+
+        # Step 3: Build proxy URL
+        local_ip = self._get_local_ip()
+        proxy_url = f"http://{local_ip}:{self._proxy_port}/stream?u={quote(yt_url, safe='')}"
+        log.info("Proxy URL: %s... (upstream %d chars)", proxy_url[:60], len(yt_url))
+
+        # Step 4: Play on speaker
+        result = await self._client.play_url(proxy_url, device)
+        log.info("play_by_url (proxied) result: %s", result)
+        return result
 
     # ── Outbound: Hermes → speaker TTS ────────────────────
 
