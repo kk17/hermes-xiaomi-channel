@@ -176,6 +176,10 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
     # Voice status keywords: check if agent is running
     _STATUS_KEYWORDS: set[str] = {"状态", "在吗", "在干嘛", "在不在"}
 
+    # Voice play music keywords: trigger music playback via yt-dlp + play_url
+    _PLAY_KEYWORDS: set[str] = {"播放音乐", "放音乐", "播放歌曲", "放首歌", "听音乐", "播放"}
+    _PLAY_STOP_KEYWORDS: set[str] = {"停止播放", "别放了", "关掉音乐", "停止音乐"}
+
     async def _on_intercepted_message(self, msg: InterceptedMessage) -> None:
         """Handle an intercepted voice command — forward to Hermes gateway.
 
@@ -256,6 +260,46 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
                     log.warning("Status TTS failed: %s", e)
             return  # Don't forward to agent
 
+        # Check for music stop command
+        if any(kw in command_text for kw in self._PLAY_STOP_KEYWORDS):
+            log.info("Voice music stop: '%s'", command_text)
+            if self._client and msg.device:
+                try:
+                    await self._client.stop_playback(msg.device)
+                    await self._client.tts("好的，音乐已停止", msg.device)
+                except Exception as e:
+                    log.warning("Music stop failed: %s", e)
+            return
+
+        # Check for music play command — search YouTube + play on speaker
+        if any(kw in command_text for kw in self._PLAY_KEYWORDS):
+            # Extract the search query: remove trigger word and play keywords
+            query = command_text
+            for kw in self._PLAY_KEYWORDS:
+                query = query.replace(kw, "")
+            query = query.strip()
+            if not query:
+                if self._client and msg.device:
+                    await self._client.tts("你想听什么歌？", msg.device)
+                return
+
+            log.info("Voice music play: query='%s'", query)
+            if self._client and msg.device:
+                try:
+                    await self._client.tts(f"正在搜索{query}", msg.device)
+                    # Search YouTube and get direct audio URL via yt-dlp
+                    audio_url = await self._get_youtube_audio_url(query)
+                    if audio_url:
+                        await self._client.play_url(audio_url, msg.device)
+                        log.info("Playing YouTube music on %s", msg.device.name)
+                    else:
+                        await self._client.tts("抱歉，没找到这首歌", msg.device)
+                except Exception as e:
+                    log.warning("Music play failed: %s", e)
+                    if self._client and msg.device:
+                        await self._client.tts("播放失败，请稍后再试", msg.device)
+            return  # Don't forward to agent
+
         # Voice-activated model switching (silent, via session_model_overrides)
         target_model = self._default_model  # start with default
         for phrase, model_name in self._MODEL_SWITCH_KEYWORDS.items():
@@ -299,6 +343,51 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(event)
+
+    # ── Music playback helpers ────────────────────────────
+
+    async def _get_youtube_audio_url(self, query: str) -> Optional[str]:
+        """Search YouTube Music and return a direct audio stream URL.
+
+        Uses yt-dlp to search and extract a playable audio URL (m4a format
+        for broad device compatibility).
+        """
+        import shutil
+        import asyncio
+
+        ytdlp = shutil.which("yt-dlp")
+        if not ytdlp:
+            log.error("yt-dlp not found on PATH")
+            return None
+
+        # yt-dlp search: "ytsearch1:query" returns first result
+        cmd = [
+            ytdlp, "-g", "-f", "140",
+            f"ytsearch1:{query}",
+            "--no-warnings",
+            "--no-playlist",
+        ]
+        log.info("yt-dlp search: %s", query)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+            url = stdout.decode().strip()
+            if url and url.startswith("http"):
+                log.info("yt-dlp got audio URL (%d chars)", len(url))
+                return url
+            else:
+                log.warning("yt-dlp returned no URL. stderr: %s", stderr.decode()[:200])
+                return None
+        except asyncio.TimeoutError:
+            log.warning("yt-dlp search timed out for: %s", query)
+            return None
+        except Exception as e:
+            log.warning("yt-dlp search failed: %s", e)
+            return None
 
     # ── Outbound: Hermes → speaker TTS ────────────────────
 
