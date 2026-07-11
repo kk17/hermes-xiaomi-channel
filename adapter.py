@@ -296,14 +296,14 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
             log.info("Voice music play: query='%s'", query)
             if self._client and msg.device:
                 try:
-                    await self._client.tts(f"正在搜索{query}", msg.device)
+                    # Skip TTS — it blocks the speaker from playing the URL
                     # Search YouTube and get direct audio URL via yt-dlp
                     audio_url = await self._get_youtube_audio_url(query)
                     if audio_url:
                         result = await self._client.play_url(audio_url, msg.device)
                         log.info("Playing YouTube music on %s (result=%s)", msg.device.name, result)
                         if not result:
-                            await self._client.tts("播放失败，音箱可能不支持此链接", msg.device)
+                            await self._client.tts("播放失败", msg.device)
                     else:
                         await self._client.tts("抱歉，没找到这首歌", msg.device)
                 except Exception as e:
