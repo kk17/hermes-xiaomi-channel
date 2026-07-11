@@ -362,17 +362,15 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         """Search YouTube via webapps API, download audio, play on speaker.
 
         Flow:
-        1. GET /api/music/search?q=<query> → top 5 results
-        2. POST /api/music/download {"video_id": ...} → cached file URL
-        3. play_by_url("http://192.168.31.222:8093/music-cache/<id>.m4a")
-
-        The webapps container handles yt-dlp download, file caching (1GB LRU),
-        and static file serving with Range support.
+        1. GET /api/music/search?q=<query> → top results (SG-filtered)
+        2. Try each result: POST /api/music/download {"video_id": ...}
+           Skip results that fail to download (geo-blocked, unavailable, etc.)
+        3. On first successful download, play on speaker immediately
         """
         import aiohttp
         from urllib.parse import quote
 
-        timeout = aiohttp.ClientTimeout(total=30)
+        timeout = aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Step 1: Search
             search_url = f"{self._WEBAPPS_URL}/api/music/search?q={quote(query)}"
@@ -392,34 +390,43 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
                 log.warning("No results for: %s", query)
                 return False
 
-            video_id = results[0]["video_id"]
-            title = results[0].get("title", "")
-            log.info("Found: %s (video_id=%s)", title, video_id)
+            log.info("Found %d results for: %s", len(results), query)
 
-            # Step 2: Download (or cache hit)
-            try:
-                async with session.post(
-                    f"{self._WEBAPPS_URL}/api/music/download",
-                    json={"video_id": video_id},
-                ) as resp:
-                    if resp.status != 200:
-                        log.warning("Download API returned %d", resp.status)
-                        return False
-                    dl_data = await resp.json()
-            except Exception as e:
-                log.warning("Download API failed: %s", e)
-                return False
+            # Step 2: Try each result until one downloads successfully
+            for i, result in enumerate(results):
+                video_id = result["video_id"]
+                title = result.get("title", "")
 
-            cached = dl_data.get("cached", False)
-            log.info("Download %s: %s (cached=%s, size=%d)",
-                     video_id, title, cached, dl_data.get("size", 0))
+                try:
+                    async with session.post(
+                        f"{self._WEBAPPS_URL}/api/music/download",
+                        json={"video_id": video_id},
+                    ) as resp:
+                        if resp.status != 200:
+                            error_detail = await resp.text()
+                            log.warning("Download failed for %s (%s): %s",
+                                        video_id, title[:40], error_detail[:100])
+                            continue  # Try next result
+                        dl_data = await resp.json()
+                except Exception as e:
+                    log.warning("Download API failed for %s: %s", video_id, e)
+                    continue  # Try next result
 
-            # Step 3: Play on speaker
-            play_url = f"{self._WEBAPPS_URL}{dl_data['url']}"
-            log.info("Playing: %s (%d chars)", play_url[:60], len(play_url))
-            result = await self._client.play_url(play_url, device)
-            log.info("play_by_url result: %s", result)
-            return result
+                cached = dl_data.get("cached", False)
+                log.info("Downloaded %s: %s (cached=%s, size=%d, attempt %d/%d)",
+                         video_id, title[:40], cached, dl_data.get("size", 0),
+                         i + 1, len(results))
+
+                # Step 3: Play on speaker
+                play_url = f"{self._WEBAPPS_URL}{dl_data['url']}"
+                log.info("Playing: %s (%d chars)", play_url[:60], len(play_url))
+                result = await self._client.play_url(play_url, device)
+                log.info("play_by_url result: %s", result)
+                return result
+
+            # All results failed
+            log.warning("All %d results failed to download for: %s", len(results), query)
+            return False
 
     # ── Outbound: Hermes → speaker TTS ────────────────────
 
