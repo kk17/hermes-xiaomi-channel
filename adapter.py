@@ -202,14 +202,19 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         # Remember which device sent this message so send() can route TTS back
         self._last_active_device = msg.device
 
-        # Immediate confirmation TTS so user knows the message was received
-        if self._client and msg.device:
+        command_text = msg.text.strip()
+
+        # For music play commands, fire TTS and search in parallel
+        # so the user doesn't wait for TTS to finish before search starts
+        is_music_play = any(kw in command_text for kw in self._PLAY_KEYWORDS)
+        if is_music_play and self._client and msg.device:
+            asyncio.create_task(self._client.tts("阿峰收到", msg.device))
+        elif self._client and msg.device:
+            # Non-music: fire TTS normally (await)
             try:
                 await self._client.tts("阿峰收到", msg.device)
             except Exception as e:
                 log.warning("Confirmation TTS failed: %s", e)
-
-        command_text = msg.text.strip()
 
         # Build source early — needed for stop/interrupt before message dispatch
         dev_name = msg.device.name if msg.device else "Xiaomi Speaker"
@@ -357,6 +362,9 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
     # Webapps FastAPI server (Docker container, port 8093)
     _WEBAPPS_URL = "http://192.168.31.222:8093"
+    # Cache of video_ids known to fail download (geo-blocked, etc.)
+    # Persisted across calls to avoid re-trying known failures
+    _failed_video_ids: set = set()
 
     async def _search_and_play_youtube(self, query: str, device) -> bool:
         """Search YouTube via webapps API, download audio, play on speaker.
@@ -364,7 +372,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         Flow:
         1. GET /api/music/search?q=<query> → top results (SG-filtered)
         2. Try each result: POST /api/music/download {"video_id": ...}
-           Skip results that fail to download (geo-blocked, unavailable, etc.)
+           Skip known-failed video_ids. Skip on download failure.
         3. On first successful download, play on speaker immediately
         """
         import aiohttp
@@ -390,10 +398,18 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
                 log.warning("No results for: %s", query)
                 return False
 
-            log.info("Found %d results for: %s", len(results), query)
+            # Filter out known-failed video_ids
+            candidates = [r for r in results if r["video_id"] not in self._failed_video_ids]
+            if not candidates:
+                # Reset and try all again (maybe temporary failures)
+                self._failed_video_ids.clear()
+                candidates = results
 
-            # Step 2: Try each result until one downloads successfully
-            for i, result in enumerate(results):
+            log.info("Found %d results (%d after filtering known failures) for: %s",
+                     len(results), len(candidates), query)
+
+            # Step 2: Try each candidate until one downloads successfully
+            for i, result in enumerate(candidates):
                 video_id = result["video_id"]
                 title = result.get("title", "")
 
@@ -406,6 +422,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
                             error_detail = await resp.text()
                             log.warning("Download failed for %s (%s): %s",
                                         video_id, title[:40], error_detail[:100])
+                            self._failed_video_ids.add(video_id)
                             continue  # Try next result
                         dl_data = await resp.json()
                 except Exception as e:
@@ -415,7 +432,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
                 cached = dl_data.get("cached", False)
                 log.info("Downloaded %s: %s (cached=%s, size=%d, attempt %d/%d)",
                          video_id, title[:40], cached, dl_data.get("size", 0),
-                         i + 1, len(results))
+                         i + 1, len(candidates))
 
                 # Step 3: Play on speaker
                 play_url = f"{self._WEBAPPS_URL}{dl_data['url']}"
@@ -425,7 +442,7 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
                 return result
 
             # All results failed
-            log.warning("All %d results failed to download for: %s", len(results), query)
+            log.warning("All %d candidates failed to download for: %s", len(candidates), query)
             return False
 
     # ── Outbound: Hermes → speaker TTS ────────────────────
