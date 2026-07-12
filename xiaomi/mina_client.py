@@ -84,6 +84,43 @@ class MinaClient:
             otp_callback=self._otp_callback,
         )
         self._mina = MiNAService(self._account)
+
+        # Monkey-patch mi_request to handle 401 relogin with passToken.
+        # miservice's default behavior: self.token = None → lose passToken
+        # → password login → OTP SMS. We intercept 401 and use passToken
+        # to refresh serviceToken without OTP.
+        _original_mi_request = self._account.mi_request
+
+        async def _patched_mi_request(sid, url, data, headers, relogin=True):
+            try:
+                return await _original_mi_request(sid, url, data, headers, relogin=False)
+            except Exception as e:
+                err_msg = str(e)
+                if '401' in err_msg or 'auth' in err_msg.lower():
+                    # Auth expired — try passToken refresh before giving up
+                    log.info("Auth expired, trying passToken refresh...")
+                    if self._account.token and 'passToken' in self._account.token:
+                        try:
+                            saved_pt = self._account.token['passToken']
+                            saved_uid = self._account.token.get('userId')
+                            resp = await self._account._serviceLogin(
+                                f"serviceLogin?sid={sid}&_json=true")
+                            if resp.get('code') == 0:
+                                st = await self._account._securityTokenService(
+                                    resp['location'], resp['nonce'], resp['ssecurity'])
+                                self._account.token[sid] = (resp['ssecurity'], st)
+                                if self._account.token_store:
+                                    await self._account.token_store.save_token(self._account.token)
+                                log.info("passToken refresh succeeded — no OTP needed!")
+                                return await _original_mi_request(sid, url, data, headers, relogin=False)
+                            else:
+                                log.warning("passToken refresh failed: code=%s", resp.get('code'))
+                        except Exception as refresh_err:
+                            log.warning("passToken refresh error: %s", refresh_err)
+                raise
+
+        self._account.mi_request = _patched_mi_request
+
         # Trigger login by calling device_list (which calls mi_request → login)
         await self._mina.device_list()
         log.info("Xiaomi login successful")
