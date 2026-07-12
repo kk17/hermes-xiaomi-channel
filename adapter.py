@@ -118,6 +118,20 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
         log.info("Connecting Xiaomi Speaker channel (trigger='%s')", self._trigger)
 
+        # Restore token file if miservice deleted it during a failed relogin.
+        # miservice sets self.token=None on 401 and calls save_token() which
+        # removes the file — but this also discards passToken, making the
+        # next login require OTP. We restore from backup so passToken survives.
+        token_path = os.path.expanduser("~/.mi.token")
+        token_bak = os.path.expanduser("~/.mi.token.bak")
+        if not os.path.exists(token_path) and os.path.exists(token_bak):
+            import shutil
+            shutil.copy2(token_bak, token_path)
+            log.info("Restored ~/.mi.token from backup (passToken preserved)")
+
+        # Update backup after successful login so it stays fresh
+        self._token_bak_pending = True
+
         # Initialize MiNA client with OTP callback that logs and raises
         # (instead of silently retrying and triggering rate limits)
         async def _otp_cb(otp_method: str) -> str:
@@ -145,6 +159,13 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
 
         # Login succeeded — reset attempt counter
         self._connect_attempts = 0
+
+        # Update token backup so passToken stays fresh for future restore
+        if getattr(self, "_token_bak_pending", False):
+            import shutil
+            shutil.copy2(token_path, token_bak)
+            log.info("Updated ~/.mi.token.bak with fresh token")
+            self._token_bak_pending = False
 
         # Discover devices
         devices = await self._client.discover_devices()
