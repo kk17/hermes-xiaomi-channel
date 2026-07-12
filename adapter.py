@@ -88,11 +88,30 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._device_name: str = "Xiaomi Speaker"
         self._last_active_device: Optional[XiaoAIDevice] = None
+        self._connect_attempts: int = 0
+        self._otp_failed: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Connect to Xiaomi cloud and start conversation polling."""
+        """Connect to Xiaomi cloud and start conversation polling.
+
+        Returns False on failure. After 3 consecutive failures (or any OTP
+        failure), returns False and sets _otp_failed to signal the gateway
+        that reconnection should stop — manual intervention is needed.
+        """
+        # Stop retrying after OTP failure or 3 consecutive failures
+        if self._otp_failed:
+            log.warning("Xiaomi connect skipped: OTP failure previously detected, manual login needed")
+            return False
+
+        if is_reconnect:
+            self._connect_attempts += 1
+            if self._connect_attempts > 3:
+                log.error("Xiaomi connect: giving up after %d failed attempts. "
+                          "Manual login needed to refresh ~/.mi.token", self._connect_attempts)
+                return False
+
         if not self._username or not self._password:
             log.error("MI_USER and MI_PASS are required")
             return False
@@ -102,8 +121,10 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         # Initialize MiNA client with OTP callback that logs and raises
         # (instead of silently retrying and triggering rate limits)
         async def _otp_cb(otp_method: str) -> str:
+            self._otp_failed = True
             log.error("Xiaomi OTP required (%s) — manual login needed. "
-                      "Run login script on NAS to refresh token.", otp_method)
+                      "Run login script on NAS to refresh token. "
+                      "Reconnection disabled until gateway restart.", otp_method)
             raise RuntimeError(
                 f"Xiaomi OTP required ({otp_method}). Token expired — "
                 "run login script on NAS to refresh ~/.mi.token"
@@ -121,6 +142,9 @@ class XiaomiSpeakerAdapter(BasePlatformAdapter):
         except Exception as e:
             log.error("Xiaomi login failed: %s", e)
             return False
+
+        # Login succeeded — reset attempt counter
+        self._connect_attempts = 0
 
         # Discover devices
         devices = await self._client.discover_devices()
